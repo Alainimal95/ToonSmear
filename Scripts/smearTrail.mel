@@ -187,45 +187,52 @@ proc loftCurves (string $smearBones[], int $crvCount, int $boneCount, string $na
     string $lead[];
     appendStringArray ($lead, $smearBones, $boneCount);
     
-    //Make the lead curves
-    $newCurve = `attachCurve -n ($name + "SmearCurve" + $crvCount + "_crv")
+	if (2 < $boneCount)
+		{
+		//Make the lead curves
+		$newCurve = `attachCurve -n ($name + "SmearCurve" + $crvCount + "_crv")
                                  -ch on  
                                  -m 1
                                  -rpo yes
                                  -kmk off
                                  $lead`;
                                  
-    $smearCurves[0] = $newCurve[0];
+		$smearCurves[0] = $newCurve[0];
                                  
-    //To make each additional curve, use bones in the same 
-    //    position in each snapshot group:
-    //    Each curve needs ($boneCount) bones, 
-	//	  There are ($boneCount) snapshot groups,
-    //    Each snapshot group has ($crvCount) curves, 
-	//    To select ($sel) the same bone in the next group,
-	//    FOR EACH CURVE: multiply selection by total crvs (minus lead), 
-    //    then add index-1 and $boneCount for curves already made
-    //
-    //A little janky, fix this later
-    for ($c = 1; $c < $crvCount; $c++)
-        {
-        //Capture Segments from smearBones
-        for ($sel = 0; $sel < $boneCount; $sel++)
-            {
-            $crvSegments[$sel] = 
+		//To make each additional curve, use bones in the same 
+		//    position in each snapshot group:
+		//    Each curve needs ($boneCount) bones, 
+		//	  There are ($boneCount) snapshot groups,
+		//    Each snapshot group has ($crvCount) curves, 
+		//    To select ($sel) the same bone in the next group,
+		//    FOR EACH CURVE: multiply selection by total crvs (minus lead), 
+		//    then add index-1 and $boneCount for curves already made
+		//
+		//A little janky, fix this later
+		for ($c = 1; $c < $crvCount; $c++)
+			{
+			//Capture Segments from smearBones
+			for ($sel = 0; $sel < $boneCount; $sel++)
+				{
+				$crvSegments[$sel] = 
 				$smearBones[( ($sel*($crvCount-1))+($c-1)+$boneCount )];
-			}
+				}
          
-        //Merge snapshot bones
-        $newCurve = `attachCurve -n ($name + "SmearCurve" + $c + "_crv")
-                                 -ch on  
-                                 -m 1
-                                 -rpo yes
-                                 -kmk off
-                                 $crvSegments`;
+			//Merge snapshot bones
+			$newCurve = `attachCurve -n ($name + "SmearCurve" + $c + "_crv")
+									-ch on  
+									-m 1
+									-rpo yes
+									-kmk off
+									$crvSegments`;
        
-        $smearCurves[$c] = $newCurve[0];
-        }
+			$smearCurves[$c] = $newCurve[0];
+			}
+		}
+		
+		else
+			$smearCurves = $smearBones;
+			
     //Switch order of curves
     string $aux = $smearCurves[0];
     $smearCurves[($crvCount)] = $aux;
