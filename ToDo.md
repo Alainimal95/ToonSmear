@@ -10,7 +10,7 @@
 - //buildCurves:
   - Look into dupe curve error issue
   - Clarify/cleanup $cmd or consider option other than eval string cmd
-  - Possible edge case: the segments are parented and created un 
+  - The segments are created and parented under the "joints." For the geometry/rivet approach, consider parenting to the rivet instead?
 - Settings:
   -  user defined suffixes
   -  expose hard-coded settings for snapshots etc (//snapshotLeads)
