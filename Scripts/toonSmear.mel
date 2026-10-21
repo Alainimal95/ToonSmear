@@ -1,0 +1,264 @@
+// toonSmear.mel (formerly called "smearTrail")
+//
+// version: 3.0.0
+//
+// Generates a cartoon-style "smear trail" mesh that follows animated
+// transforms (joints, locators, rivets, etc.).
+//
+// USAGE
+//   1. Select two or more animated transforms IN THE ORDER you want them
+//      connected (pick order is respected; they do not need to share a
+//      hierarchy).
+//   2. Run the script and enter a name when prompted.
+//
+// HOW IT WORKS
+//   - One live degree-1 curve has each CV driven by the world position of
+//     one selected transform (decomposeMatrix -> controlPoints).
+//   - The live curve is snapshotted over the last few frames. The snapshot
+//     curves come back oldest -> newest, so they can be lofted directly.
+//   - An expression keeps the snapshot window tied to the current frame
+//     (also needed so a static target still updates).
+//   - The loft is converted to polygons. Everything is parented under
+//     <name>Smear_grp, which should stay at identity (don't move it).
+//
+// NOTES
+//   - Written against Maya 2022 conventions, tested in Maya 2027.
+//   - If the target is static, tessellation warnings may appear because all
+//     trail curves coincide. The result is still valid.
+//   - Snapshots evaluate the target at past times, so this works for
+//     keyframed animation but not for sims that depend on prior state.
+//   - Smoothing (rebuild) is OFF by default. When on, the rebuilt curve keeps
+//     its end points but does NOT pass through intermediate transforms.
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// getUI
+//    Prompts for a name. Returns "" if cancelled or invalid.
+
+proc string getUI ()
+{
+    string $btn = `promptDialog
+        -title "Smear Trail"
+        -message ("Name of smear:\n\n" +
+                  "Note: If target is static, tessellation\n" +
+                  "warnings may appear in the command line\n" +
+                  "even if the operation is successful.")
+        -text "smear"
+        -button "OK" -button "Cancel"
+        -defaultButton "OK" -cancelButton "Cancel"
+        -dismissString "Cancel"`;
+
+    if ($btn != "OK")
+        return "";
+
+    string $n = strip(`promptDialog -query -text`);
+
+    // Name must work in the eval string:
+    // no letters, digits or underscores and must not start with a digit.
+    if ($n == "" || !isValidObjectName($n))
+    {
+    warning "Name must start with a letter and contain only letters, numbers and underscores.";
+    return "";
+    }
+
+    return $n;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// buildLiveCurve
+//    One degree-1 curve whose CVs track the world position of each
+//    transform in $sel. Returns the curve transform.
+
+proc string buildLiveCurve (string $sel[], string $name, int $smoothSpans)
+{
+    int $n = size($sel);
+    int $i;
+
+    // matrixNodes ships with Maya; this guard is harmless if already loaded
+    if (catch(`loadPlugin -quiet "matrixNodes"`))
+        warning "Could not load matrixNodes; decomposeMatrix may be unavailable.";
+
+    // Placeholder points (CVs get driven below)
+    string $cmd = ("curve -d 1 -n \"" + $name + "SmearLive_crv\"");
+    for ($i = 0; $i < $n; $i++)
+        $cmd += (" -p " + $i + " 0 0");
+    string $crv = eval($cmd);
+
+    string $shapes[] = `listRelatives -shapes -path $crv`;
+
+    // Keep CV values == world space
+    setAttr ($crv + ".inheritsTransform") 0;
+    
+    // Break out each target's world pos from its matrix (using decomposeMatrix) and
+    // connect it to its corresponding CV's world pos
+    for ($i = 0; $i < $n; $i++)
+    {
+        string $dm = `createNode decomposeMatrix -n ($name + "SmearDM" + ($i + 1))`;
+        connectAttr -force ($sel[$i] + ".worldMatrix[0]") ($dm + ".inputMatrix");
+        connectAttr -force ($dm + ".outputTranslate")
+                           ($shapes[0] + ".controlPoints[" + $i + "]");
+    }
+
+    // Optional smoothing. Do this ONCE, before snapshotting, so every trail
+    // curve has the same span count (required for a clean loft).
+    if ($smoothSpans > 0)
+    {
+        rebuildCurve -ch 1 -rpo 1 -rt 0 -end 1 -kr 0 -kcp 0 -kep 1 -kt 0
+                     -s $smoothSpans -d 3 -tol 0.01 $crv;
+    }
+
+    return $crv;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// snapshotLive
+//    Creates animation snapshots of the live curve over [frame - $trail, frame],
+//    keeps the window tied to the current frame with an expression, and renames the results.
+//    Returns the trail curves, oldest -> newest.
+//    $outGrp[0] receives the snapshot group name.
+
+proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGrp[])
+{
+    float $frame = `currentTime -query`;
+
+    // Returns: [0] = snapshot group, [1] = snapshot node
+    string $snap[] = `snapshot -n ($name + "Snap")
+                               -ch on
+                               -startTime ($frame - $trail)
+                               -endTime $frame
+                               -increment 1
+                               $crv`;
+
+    string $snapNode = $snap[1];
+
+    expression -n ($name + "Smear_exp") -s (
+        $snapNode + ".startTime = frame - " + $trail + ";\n" +
+        $snapNode + ".endTime = frame;\n" +
+        $snapNode + ".increment = 1;\n"
+        );
+
+    string $trailCrvs[] = `listRelatives -children -path $snap[0]`;
+
+    // Rename right away
+    int $i;
+    for ($i = 0; $i < size($trailCrvs); $i++)
+        $trailCrvs[$i] = `rename $trailCrvs[$i] ($name + "SmearTrail" + ($i + 1) + "_crv")`;
+
+    $outGrp[0] = `rename $snap[0] ($name + "SmearTrail_grp")`;
+
+    return $trailCrvs;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// loftSmear
+//    Lofts the trail curves and converts the surface to polygons.
+//    Returns { loft surface transform, poly geo transform }.
+
+proc string[] loftSmear (string $trailCrvs[], string $name)
+{
+    // Loft degree can't exceed (sections - 1)
+    int $deg = min(3, size($trailCrvs) - 1);
+
+    string $loft[] = `loft -n ($name + "SmearLoft")
+                           -ch on
+                           -ss 2
+                           -d $deg
+                           $trailCrvs`;
+
+    // history, quads, general format, u/v number 2/5.
+    // Without -ut/-vt set, these counts rely on the command's default
+    // tessellation types; if the mesh density looks off, check those flags.
+    string $geo[] = `nurbsToPoly -n ($name + "Smear_geo")
+                                 -ch on
+                                 -pt 1
+                                 -f 2
+                                 -un 2
+                                 -vn 5
+                                 $loft[0]`;
+
+    string $result[] = { $loft[0], $geo[0] };
+    return $result;
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+// smearBuild
+//    Does the work. Returns the top-level group name.
+
+proc string smearBuild (string $sel[], string $name)
+{
+    // --- Settings ---------------------------------------------------------
+    int $trail       = 4;   // frames of trail (gives $trail + 1 sections)
+    int $smoothSpans = 0;   // 0 = off (faceted chain); e.g. 8 = rebuild to a
+                            // degree-3 curve with that many spans
+    // ----------------------------------------------------------------------
+
+    string $crv = buildLiveCurve($sel, $name, $smoothSpans);
+
+    string $snapGrp[];
+    string $trailCrvs[] = snapshotLive($crv, $name, $trail, $snapGrp);
+
+    string $made[] = loftSmear($trailCrvs, $name);
+
+    // Tidy: everything under one group, intermediates hidden
+    string $grp = `group -empty -n ($name + "Smear_grp")`;
+    parent $crv $snapGrp[0] $made[0] $made[1] $grp;
+
+    hide $crv;
+    hide $snapGrp[0];
+    hide $made[0];
+
+    return $grp;
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+// toonSmear
+//    Entry point: validate selection, prompt, build inside one undo chunk.
+
+proc toonSmear ()
+{
+    // Pick order is respected; long names avoid duplicate-name ambiguity
+    string $sel[] = `ls -sl -long`;
+
+    if (size($sel) < 2)
+        error "Must select at least 2 transforms to generate smear";
+
+    // This may change when geo selection is added later
+    string $each;
+    for ($each in $sel)
+    {
+        if (!`objectType -isAType "transform" $each`)
+            error ("Selection must be transforms only (not components): " + $each);
+    }
+
+    string $name = getUI();
+    if ($name == "")
+        return;
+
+    if (`objExists ($name + "Smear_grp")`)
+        error ("A smear named '" + $name + "' already exists. Choose another name.");
+
+    undoInfo -openChunk;
+    int $failed = catch(`smearBuild $sel $name`);
+    undoInfo -closeChunk;
+
+    // Restore the user's selection
+    select -r $sel;
+
+    if ($failed)
+        error "Smear creation failed; see Script Editor for details.";
+
+    print ("Smear '" + $name + "' created from " + size($sel) + " transforms.\n");
+}
+
+///////////////////////////////////////////////////////////////////////////
+
+toonSmear;
