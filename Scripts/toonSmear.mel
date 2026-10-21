@@ -1,6 +1,6 @@
 // toonSmear.mel (formerly called "smearTrail")
 //
-// version: 3.0.0
+// version: 3.1.0
 //
 // Generates a cartoon-style "smear trail" mesh that follows animated
 // transforms (joints, locators, rivets, etc.).
@@ -17,14 +17,17 @@
 //   - The live curve is snapshotted over the last few frames. The snapshot
 //     curves come back oldest -> newest, so they can be lofted directly.
 //   - An expression keeps the snapshot window tied to the current frame
-//     (also needed so a static target still updates).
+//     (also needed so a smear created on a frame without motion still
+//     updates when you scrub).
 //   - The loft is converted to polygons. Everything is parented under
 //     <name>Smear_grp, which should stay at identity (don't move it).
 //
 // NOTES
 //   - Written against Maya 2022 conventions, tested in Maya 2027.
-//   - If the target is static, tessellation warnings may appear because all
-//     trail curves coincide. The result is still valid.
+//   - If the targets don't move during the trail window (frame-4 to frame)
+//     on the frame you run this, all trail curves coincide and Maya reports
+//     tessellation errors. The script warns about this, and the smear
+//     updates once you scrub to a frame with motion.
 //   - Snapshots evaluate the target at past times, so this works for
 //     keyframed animation but not for sims that depend on prior state.
 //   - Smoothing (rebuild) is OFF by default. When on, the rebuilt curve keeps
@@ -40,10 +43,7 @@ proc string getUI ()
 {
     string $btn = `promptDialog
         -title "Smear Trail"
-        -message ("Name of smear:\n\n" +
-                  "Note: If target is static, tessellation\n" +
-                  "warnings may appear in the command line\n" +
-                  "even if the operation is successful.")
+        -message "Name of smear:"
         -text "smear"
         -button "OK" -button "Cancel"
         -defaultButton "OK" -cancelButton "Cancel"
@@ -55,7 +55,7 @@ proc string getUI ()
     string $n = strip(`promptDialog -query -text`);
 
     // Name must work in the eval string:
-    // no letters, digits or underscores and must not start with a digit.
+    // only letters, digits and underscores, and must start with a letter.
     if ($n == "" || !isValidObjectName($n))
     {
     warning "Name must start with a letter and contain only letters, numbers and underscores.";
@@ -157,6 +157,31 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
 
 ///////////////////////////////////////////////////////////////////////////
 
+// trailHasMotion
+//    Returns 1 if any trail curve differs from the first by more than $tol
+//    (scene units) at any CV, otherwise 0. Trail curves sit under an
+//    identity group, so their world-space CVs are the real trail positions.
+
+proc int trailHasMotion (string $trailCrvs[], float $tol)
+{
+    float $ref[] = `xform -query -worldSpace -translation ($trailCrvs[0] + ".cv[*]")`;
+
+    int $c, $k;
+    for ($c = 1; $c < size($trailCrvs); $c++)
+    {
+        float $pos[] = `xform -query -worldSpace -translation ($trailCrvs[$c] + ".cv[*]")`;
+        for ($k = 0; $k < size($ref); $k++)
+        {
+            if (abs($pos[$k] - $ref[$k]) > $tol)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
 // loftSmear
 //    Lofts the trail curves and converts the surface to polygons.
 //    Returns { loft surface transform, poly geo transform }.
@@ -204,6 +229,27 @@ proc string smearBuild (string $sel[], string $name)
 
     string $snapGrp[];
     string $trailCrvs[] = snapshotLive($crv, $name, $trail, $snapGrp);
+
+    // Warn if the targets don't move during the trail window. Maya's own
+    // errors in that case (degenerate loft/tessellation) don't say why.
+    // The status bar only shows the latest message, so the tessellation
+    // errors would bury a plain warning. Also show it in the viewport.
+    if (!trailHasMotion($trailCrvs, 0.0001))
+    {
+        float $f = `currentTime -query`;
+        string $msg = ("No motion detected between frames " + ($f - $trail) + " and " + $f +
+                       ". The trail curves coincide, so tessellation errors are expected. " +
+                       "The smear will update once you move to a frame with motion.");
+
+        // Script Editor log
+        warning $msg;
+
+        // Viewport message (catch in case there's no UI, e.g. batch mode)
+        catch(`inViewMessage -assistMessage ("<hl>Smear:</hl> " + $msg)
+                             -position midCenterTop
+                             -fade
+                             -fadeStayTime 6000`);
+    }
 
     string $made[] = loftSmear($trailCrvs, $name);
 
