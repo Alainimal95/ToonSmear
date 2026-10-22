@@ -1,6 +1,6 @@
 // toonSmear.mel (formerly called "smearTrail")
 //
-// version: 3.2.1
+// version: 3.2.2
 //
 // Generates a cartoon-style "smear trail" mesh that follows animated
 // transforms (joints, locators, rivets, etc.).
@@ -26,17 +26,17 @@
 //     (also needed so a smear created on a frame without motion still
 //     updates when you scrub).
 //   - The loft is converted to polygons. Everything is parented under
-//     <name>_Smear_<groupSuffix>, which should stay at identity (don't move it).
+//     <name>_smear_<groupSuffix>, which should stay at identity (don't move it).
 //
 // NAMING
 //   Every node is named <name>_<descriptor>_<suffix>, e.g. with name "arm":
-//     arm_Smear_grp          top group
-//     arm_SmearLive_crv      live curve
-//     arm_SmearTrail_grp     snapshot group
-//     arm_SmearTrail1_crv    trail curves
-//     arm_SmearLoft_srf      loft surface
-//     arm_Smear_geo          final polygon geometry
-//   Fixed names (no suffix field): arm_Snap, arm_Smear_exp, arm_SmearDM1...
+//     arm_smear_grp          top group
+//     arm_smearLive_crv      live curve
+//     arm_smearTrail_grp     snapshot group
+//     arm_smearTrail1_crv    trail curves
+//     arm_smearLoft_srf      loft surface
+//     arm_smear_geo          final polygon geometry
+//   Fixed names (no suffix field): arm_snap, arm_smear_exp, arm_smearDM1...
 //
 // NOTES
 //   - Written against Maya 2022 conventions, tested in Maya 2027.
@@ -267,7 +267,7 @@ global proc toonSmear_dialogOk ()
         }
     }
 
-    // Group, geometry and the expression ("exp") share the "Smear" descriptor,
+    // Group, geometry and the expression ("exp") share the "smear" descriptor,
     // so their suffixes must all differ or the names would collide.
     if ($sfx[0] == $sfx[3] || $sfx[0] == "exp" || $sfx[3] == "exp")
     {
@@ -278,7 +278,7 @@ global proc toonSmear_dialogOk ()
         return;
     }
 
-    if (`objExists (toonSmear_name($n, "Smear", $sfx[0]))`)
+    if (`objExists (toonSmear_name($n, "smear", $sfx[0]))`)
     {
         text -edit -label ("A smear named '" + $n + "' already exists.")
              toonSmear_errorLabel;
@@ -332,7 +332,7 @@ proc string buildLiveCurve (string $sel[], string $name)
     if (catch(`loadPlugin -quiet "matrixNodes"`))
         warning "Could not load matrixNodes; decomposeMatrix may be unavailable.";
 
-    string $crvName = toonSmear_name($name, "SmearLive", toonSmear_suffix("Crv"));
+    string $crvName = toonSmear_name($name, "smearLive", toonSmear_suffix("Crv"));
 
     // Placeholder points (CVs get driven below)
     string $cmd = ("curve -d 1 -n \"" + $crvName + "\"");
@@ -349,7 +349,7 @@ proc string buildLiveCurve (string $sel[], string $name)
     // connect it to its corresponding CV's world pos
     for ($i = 0; $i < $n; $i++)
     {
-        string $dm = `createNode decomposeMatrix -n (toonSmear_name($name, ("SmearDM" + ($i + 1)), ""))`;
+        string $dm = `createNode decomposeMatrix -n (toonSmear_name($name, ("smearDM" + ($i + 1)), ""))`;
         connectAttr -force ($sel[$i] + ".worldMatrix[0]") ($dm + ".inputMatrix");
         connectAttr -force ($dm + ".outputTranslate")
                            ($shapes[0] + ".controlPoints[" + $i + "]");
@@ -372,7 +372,7 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
     float $frame = `currentTime -query`;
 
     // Returns: [0] = snapshot group, [1] = snapshot node
-    string $snap[] = `snapshot -n (toonSmear_name($name, "Snap", ""))
+    string $snap[] = `snapshot -n (toonSmear_name($name, "snap", ""))
                                -ch on
                                -startTime ($frame - $trail)
                                -endTime $frame
@@ -381,7 +381,7 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
 
     string $snapNode = $snap[1];
 
-    expression -n (toonSmear_name($name, "Smear", "exp")) -s (
+    expression -n (toonSmear_name($name, "smear", "exp")) -s (
         $snapNode + ".startTime = frame - " + $trail + ";\n" +
         $snapNode + ".endTime = frame;\n" +
         $snapNode + ".increment = 1;\n"
@@ -394,9 +394,9 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
     string $crvSuffix = toonSmear_suffix("Crv");
     for ($i = 0; $i < size($trailCrvs); $i++)
         $trailCrvs[$i] = `rename $trailCrvs[$i]
-                                 (toonSmear_name($name, ("SmearTrail" + ($i + 1)), $crvSuffix))`;
+                                 (toonSmear_name($name, ("smearTrail" + ($i + 1)), $crvSuffix))`;
 
-    $outGrp[0] = `rename $snap[0] (toonSmear_name($name, "SmearTrail", toonSmear_suffix("Grp")))`;
+    $outGrp[0] = `rename $snap[0] (toonSmear_name($name, "smearTrail", toonSmear_suffix("Grp")))`;
 
     return $trailCrvs;
 }
@@ -438,7 +438,7 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
     // Loft degree can't exceed (sections - 1)
     int $deg = min(3, size($trailCrvs) - 1);
 
-    string $loft[] = `loft -n (toonSmear_name($name, "SmearLoft", toonSmear_suffix("Srf")))
+    string $loft[] = `loft -n (toonSmear_name($name, "smearLoft", toonSmear_suffix("Srf")))
                            -ch on
                            -ss 2
                            -d $deg
@@ -447,7 +447,7 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
     // history, quads, general format, u/v number 2/5.
     // Without -ut/-vt set, these counts rely on the command's default
     // tessellation types; if the mesh density looks off, check those flags.
-    string $geo[] = `nurbsToPoly -n (toonSmear_name($name, "Smear", toonSmear_suffix("Geo")))
+    string $geo[] = `nurbsToPoly -n (toonSmear_name($name, "smear", toonSmear_suffix("Geo")))
                                  -ch on
                                  -pt 1
                                  -f 2
@@ -499,7 +499,7 @@ proc string smearBuild (string $sel[], string $name)
     string $made[] = loftSmear($trailCrvs, $name);
 
     // Tidy: everything under one group, intermediates hidden
-    string $grp = `group -empty -n (toonSmear_name($name, "Smear", toonSmear_suffix("Grp")))`;
+    string $grp = `group -empty -n (toonSmear_name($name, "smear", toonSmear_suffix("Grp")))`;
     parent $crv $snapGrp[0] $made[0] $made[1] $grp;
 
     hide $crv;
@@ -535,7 +535,7 @@ proc toonSmear ()
         return;
 
     // Also checked in the dialog; kept as a safety net
-    if (`objExists (toonSmear_name($name, "Smear", toonSmear_suffix("Grp")))`)
+    if (`objExists (toonSmear_name($name, "smear", toonSmear_suffix("Grp")))`)
         error ("A smear named '" + $name + "' already exists. Choose another name.");
 
     undoInfo -openChunk;
