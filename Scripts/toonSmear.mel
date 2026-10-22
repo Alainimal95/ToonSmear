@@ -1,6 +1,6 @@
 // toonSmear.mel (formerly called "smearTrail")
 //
-// version: 3.1.0
+// version: 3.2.0
 //
 // Generates a cartoon-style "smear trail" mesh that follows animated
 // transforms (joints, locators, rivets, etc.).
@@ -9,7 +9,10 @@
 //   1. Select two or more animated transforms IN THE ORDER you want them
 //      connected (pick order is respected; they do not need to share a
 //      hierarchy).
-//   2. Run the script and enter a name when prompted.
+//   2. Run the script, then enter a name and adjust the settings:
+//        - Trail length (frames): how far back the trail reaches (min 3, so
+//          the loft can always be degree 3).
+//      Settings are remembered between runs (optionVars named toonSmear_*).
 //
 // HOW IT WORKS
 //   - One live degree-1 curve has each CV driven by the world position of
@@ -24,45 +27,127 @@
 //
 // NOTES
 //   - Written against Maya 2022 conventions, tested in Maya 2027.
-//   - If the targets don't move during the trail window (frame-4 to frame)
-//     on the frame you run this, all trail curves coincide and Maya reports
-//     tessellation errors. The script warns about this, and the smear
-//     updates once you scrub to a frame with motion.
+//   - If the targets don't move during the trail window (current frame minus
+//     trail length, up to the current frame) on the frame you run this, all
+//     trail curves coincide and Maya reports tessellation errors. The script
+//     warns about this, and the smear updates once you scrub to a frame with
+//     motion.
 //   - Snapshots evaluate the target at past times, so this works for
 //     keyframed animation but not for sims that depend on prior state.
-//   - Smoothing (rebuild) is OFF by default. When on, the rebuilt curve keeps
-//     its end points but does NOT pass through intermediate transforms.
 
 
 ///////////////////////////////////////////////////////////////////////////
 
-// getUI
-//    Prompts for a name. Returns "" if cancelled or invalid.
+// Dialog
+//    layoutDialog calls its UI proc and button scripts by name (as strings),
+//    so toonSmear_dialogUI and toonSmear_dialogOk must be GLOBAL procs; local
+//    procs aren't visible to them. The dialog hands its values back through
+//    optionVars, which also remember the last-used settings between runs.
+//
+//    optionVars used:
+//      toonSmear_name     (string)  name entered in the dialog
+//      toonSmear_trail    (int)     trail length in frames
+//
+//    $gToonSmear_selCount is a global int that tells the dialog how many
+//    transforms are selected (so smoothing can be disabled for 2). It is NOT
+//    declared at file scope: MEL only needs each proc that uses a global to
+//    declare it with "global" inside its own body. getUI sets it and
+//    toonSmear_dialogUI reads it, so each declares it locally.
 
-proc string getUI ()
+global proc toonSmear_dialogUI ()
 {
-    string $btn = `promptDialog
-        -title "Smear Trail"
-        -message "Name of smear:"
-        -text "smear"
-        -button "OK" -button "Cancel"
-        -defaultButton "OK" -cancelButton "Cancel"
-        -dismissString "Cancel"`;
+    //global int $gToonSmear_selCount;
 
-    if ($btn != "OK")
-        return "";
+    // Last-used values, or defaults
+    int $trail  = 4;
+    if (`optionVar -exists "toonSmear_trail"`)
+        $trail = `optionVar -query "toonSmear_trail"`;
 
-    string $n = strip(`promptDialog -query -text`);
+    // layoutDialog default dimensions
+    string $form = `setParent -query`;
+    formLayout -edit -width 328 -height 125 $form;
+
+    string $col = `columnLayout -adjustableColumn true -rowSpacing 6`;
+
+        textFieldGrp -label "Name" -text "smear"
+                     -columnWidth2 150 150
+                     
+                     toonSmear_nameField;
+
+        // Shows validation messages without closing the dialog
+        text -label " " -align "left" toonSmear_errorLabel;
+
+        intSliderGrp -label "Trail length (frames)" -field true
+                     -minValue 3 -maxValue 30
+                     -fieldMinValue 3 -fieldMaxValue 60
+                     -value $trail
+                     -columnWidth3 150 40 110
+                     toonSmear_trailField;
+
+        rowLayout -numberOfColumns 2 -columnWidth2 150 150
+                  -columnAttach2 "both" "both";
+            button -label "OK" -command "toonSmear_dialogOk";
+            button -label "Cancel" -command "layoutDialog -dismiss \"Cancel\"";
+        setParent ..;
+
+    setParent ..;
+
+    formLayout -edit
+        -attachForm $col "top"   10
+        -attachForm $col "left"  10
+        -attachForm $col "right" 10
+        $form;
+}
+
+global proc toonSmear_dialogOk ()
+{
+    string $n = strip(`textFieldGrp -query -text toonSmear_nameField`);
 
     // Name must work in the eval string:
     // only letters, digits and underscores, and must start with a letter.
     if ($n == "" || !isValidObjectName($n))
     {
-    warning "Name must start with a letter and contain only letters, numbers and underscores.";
-    return "";
+        text -edit -label "Name must start with a letter; letters, numbers and _ only."
+             toonSmear_errorLabel;
+        return;
     }
 
-    return $n;
+    if (`objExists ($n + "Smear_grp")`)
+    {
+        text -edit -label ("A smear named '" + $n + "' already exists.")
+             toonSmear_errorLabel;
+        return;
+    }
+
+    int $trail  = `intSliderGrp -query -value toonSmear_trailField`;
+    
+    // Clamp in case a typed value got past the field limits
+    $trail = max(3, min(60, $trail));
+
+    optionVar -stringValue "toonSmear_name"   $n;
+    optionVar -intValue    "toonSmear_trail"  $trail;
+
+    layoutDialog -dismiss "OK";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// getUI
+//    Shows the settings dialog. Returns the smear name, or "" if cancelled.
+//    The settings themselves are read from the optionVars by smearBuild.
+
+proc string getUI (int $selCount)
+{
+    global int $gToonSmear_selCount;
+    $gToonSmear_selCount = $selCount;
+
+    string $result = `layoutDialog -title "Smear Trail" -uiScript "toonSmear_dialogUI"`;
+
+    if ($result != "OK")
+        return "";
+
+    return `optionVar -query "toonSmear_name"`;
 }
 
 
@@ -72,7 +157,7 @@ proc string getUI ()
 //    One degree-1 curve whose CVs track the world position of each
 //    transform in $sel. Returns the curve transform.
 
-proc string buildLiveCurve (string $sel[], string $name, int $smoothSpans)
+proc string buildLiveCurve (string $sel[], string $name)
 {
     int $n = size($sel);
     int $i;
@@ -91,7 +176,7 @@ proc string buildLiveCurve (string $sel[], string $name, int $smoothSpans)
 
     // Keep CV values == world space
     setAttr ($crv + ".inheritsTransform") 0;
-    
+
     // Break out each target's world pos from its matrix (using decomposeMatrix) and
     // connect it to its corresponding CV's world pos
     for ($i = 0; $i < $n; $i++)
@@ -100,14 +185,6 @@ proc string buildLiveCurve (string $sel[], string $name, int $smoothSpans)
         connectAttr -force ($sel[$i] + ".worldMatrix[0]") ($dm + ".inputMatrix");
         connectAttr -force ($dm + ".outputTranslate")
                            ($shapes[0] + ".controlPoints[" + $i + "]");
-    }
-
-    // Optional smoothing. Do this ONCE, before snapshotting, so every trail
-    // curve has the same span count (required for a clean loft).
-    if ($smoothSpans > 0)
-    {
-        rebuildCurve -ch 1 -rpo 1 -rt 0 -end 1 -kr 0 -kcp 0 -kep 1 -kt 0
-                     -s $smoothSpans -d 3 -tol 0.01 $crv;
     }
 
     return $crv;
@@ -219,13 +296,11 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
 
 proc string smearBuild (string $sel[], string $name)
 {
-    // --- Settings ---------------------------------------------------------
-    int $trail       = 4;   // frames of trail (gives $trail + 1 sections)
-    int $smoothSpans = 0;   // 0 = off (faceted chain); e.g. 8 = rebuild to a
-                            // degree-3 curve with that many spans
+    // --- Settings (chosen in the dialog, stored in optionVars) ------------
+    int $trail       = `optionVar -query "toonSmear_trail"`;   // frames of trail
     // ----------------------------------------------------------------------
 
-    string $crv = buildLiveCurve($sel, $name, $smoothSpans);
+    string $crv = buildLiveCurve($sel, $name);
 
     string $snapGrp[];
     string $trailCrvs[] = snapshotLive($crv, $name, $trail, $snapGrp);
@@ -267,7 +342,7 @@ proc string smearBuild (string $sel[], string $name)
 ///////////////////////////////////////////////////////////////////////////
 
 // toonSmear
-//    Entry point: validate selection, prompt, build inside one undo chunk.
+//    Entry point: validate selection, show settings, build inside one undo chunk.
 
 proc toonSmear ()
 {
@@ -285,7 +360,7 @@ proc toonSmear ()
             error ("Selection must be transforms only (not components): " + $each);
     }
 
-    string $name = getUI();
+    string $name = getUI(size($sel));
     if ($name == "")
         return;
 
