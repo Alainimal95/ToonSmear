@@ -1,6 +1,6 @@
 // toonSmear.mel (formerly called "smearTrail")
 //
-// version: 3.2.0
+// version: 3.2.1
 //
 // Generates a cartoon-style "smear trail" mesh that follows animated
 // transforms (joints, locators, rivets, etc.).
@@ -12,6 +12,9 @@
 //   2. Run the script, then enter a name and adjust the settings:
 //        - Trail length (frames): how far back the trail reaches (min 3, so
 //          the loft can always be degree 3).
+//        - Suffixes (collapsed section): the suffix used on groups, curves,
+//          the loft surface and the final geometry. A leading underscore is
+//          optional; one is always added between the descriptor and suffix.
 //      Settings are remembered between runs (optionVars named toonSmear_*).
 //
 // HOW IT WORKS
@@ -23,7 +26,17 @@
 //     (also needed so a smear created on a frame without motion still
 //     updates when you scrub).
 //   - The loft is converted to polygons. Everything is parented under
-//     <name>Smear_grp, which should stay at identity (don't move it).
+//     <name>_Smear_<groupSuffix>, which should stay at identity (don't move it).
+//
+// NAMING
+//   Every node is named <name>_<descriptor>_<suffix>, e.g. with name "arm":
+//     arm_Smear_grp          top group
+//     arm_SmearLive_crv      live curve
+//     arm_SmearTrail_grp     snapshot group
+//     arm_SmearTrail1_crv    trail curves
+//     arm_SmearLoft_srf      loft surface
+//     arm_Smear_geo          final polygon geometry
+//   Fixed names (no suffix field): arm_Snap, arm_Smear_exp, arm_SmearDM1...
 //
 // NOTES
 //   - Written against Maya 2022 conventions, tested in Maya 2027.
@@ -38,45 +51,132 @@
 
 ///////////////////////////////////////////////////////////////////////////
 
+// Naming helpers
+//    Global so both the dialog callbacks and the build procs can use them.
+
+// toonSmear_cleanSuffix
+//    Trims whitespace and leading underscores, so "_grp", "__grp" and "grp"
+//    all become "grp" (the underscore is added back by toonSmear_name).
+
+global proc string toonSmear_cleanSuffix (string $s)
+{
+    string $c = strip($s);
+
+    string $lead = match("^_+", $c);
+    if ($lead != "")
+    {
+        if (size($lead) >= size($c))
+            $c = "";
+        else
+            $c = substring($c, size($lead) + 1, size($c));
+    }
+    return $c;
+}
+
+// toonSmear_name
+//    <name>_<descriptor>_<suffix>. An empty suffix gives <name>_<descriptor>.
+
+global proc string toonSmear_name (string $name, string $descriptor, string $suffix)
+{
+    string $s = toonSmear_cleanSuffix($suffix);
+    string $out = ($name + "_" + $descriptor);
+
+    if ($s != "")
+        $out += ("_" + $s);
+
+    return $out;
+}
+
+// toonSmear_suffix
+//    Current suffix for a key ("Grp", "Crv", "Srf", "Geo"): the saved
+//    optionVar if there is one, otherwise the default.
+
+global proc string toonSmear_suffix (string $key)
+{
+    string $var = ("toonSmear_sfx" + $key);
+
+    if (`optionVar -exists $var`)
+        return `optionVar -query $var`;
+
+    if ($key == "Grp") return "grp";
+    if ($key == "Crv") return "crv";
+    if ($key == "Srf") return "srf";
+    if ($key == "Geo") return "geo";
+    return "";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
 // Dialog
 //    layoutDialog calls its UI proc and button scripts by name (as strings),
-//    so toonSmear_dialogUI and toonSmear_dialogOk must be GLOBAL procs; local
-//    procs aren't visible to them. The dialog hands its values back through
-//    optionVars, which also remember the last-used settings between runs.
+//    so the toonSmear_dialog* procs must be GLOBAL procs; local procs aren't
+//    visible to them. The dialog hands its values back through optionVars,
+//    which also remember the last-used settings between runs.
 //
 //    optionVars used:
 //      toonSmear_name     (string)  name entered in the dialog
 //      toonSmear_trail    (int)     trail length in frames
+//      toonSmear_sfxGrp   (string)  group suffix
+//      toonSmear_sfxCrv   (string)  curve suffix
+//      toonSmear_sfxSrf   (string)  loft surface suffix
+//      toonSmear_sfxGeo   (string)  polygon geometry suffix
 //
-//    $gToonSmear_selCount is a global int that tells the dialog how many
-//    transforms are selected (so smoothing can be disabled for 2). It is NOT
-//    declared at file scope: MEL only needs each proc that uses a global to
-//    declare it with "global" inside its own body. getUI sets it and
-//    toonSmear_dialogUI reads it, so each declares it locally.
+//    $gToonSmear_form holds the dialog's top-level form so the suffix
+//    section can resize it when expanded/collapsed. Each proc that uses a
+//    global declares it with "global" inside its own body.
+
+// toonSmear_dialogHeight
+//    Dialog height with the suffix section collapsed / expanded. These are
+//    estimates: tweak them here if the dialog looks cramped or loose. If the
+//    dialog doesn't resize when the section is toggled, set the collapsed
+//    value equal to the expanded one so nothing is ever clipped.
+
+global proc int toonSmear_dialogHeight (int $collapsed)
+{
+    if ($collapsed)
+        return 190;
+    return 320;
+}
+
+global proc toonSmear_dialogResize (int $collapsed)
+{
+    global string $gToonSmear_form;
+
+    if ($gToonSmear_form == "")
+        return;
+
+    catch(`formLayout -edit -height (toonSmear_dialogHeight($collapsed)) $gToonSmear_form`);
+}
 
 global proc toonSmear_dialogUI ()
 {
-    //global int $gToonSmear_selCount;
+    global string $gToonSmear_form;
 
     // Last-used values, or defaults
-    int $trail  = 4;
+    int $trail = 4;
     if (`optionVar -exists "toonSmear_trail"`)
         $trail = `optionVar -query "toonSmear_trail"`;
 
-    // layoutDialog default dimensions
-    string $form = `setParent -query`;
-    formLayout -edit -width 328 -height 125 $form;
+    // Suffix keys and the labels shown for them
+    string $keys[]   = {"Grp", "Crv", "Srf", "Geo"};
+    string $labels[] = {"Group", "Curve", "Surface", "Geometry"};
+    int $i;
 
+    // layoutDialog dimensions (starts with the suffix section collapsed)
+    string $form = `setParent -query`;
+    $gToonSmear_form = $form;
+    formLayout -edit -width 328 -height (toonSmear_dialogHeight(1)) $form;
+
+    // --- Settings (top) ---------------------------------------------------
     string $col = `columnLayout -adjustableColumn true -rowSpacing 6`;
 
+        // Smear name
         textFieldGrp -label "Name" -text "smear"
                      -columnWidth2 150 150
-                     
                      toonSmear_nameField;
 
-        // Shows validation messages without closing the dialog
-        text -label " " -align "left" toonSmear_errorLabel;
-
+        // Trail length
         intSliderGrp -label "Trail length (frames)" -field true
                      -minValue 3 -maxValue 30
                      -fieldMinValue 3 -fieldMaxValue 60
@@ -84,18 +184,51 @@ global proc toonSmear_dialogUI ()
                      -columnWidth3 150 40 110
                      toonSmear_trailField;
 
+        separator -height 8 -style "none";
+
+        // Suffixes (collapsible). A frameLayout may have only one child,
+        // so the fields live in a column inside it.
+        frameLayout -label "Suffixes" -collapsable true -collapse true
+                    -marginWidth 4 -marginHeight 4
+                    -collapseCommand "toonSmear_dialogResize 1"
+                    -expandCommand   "toonSmear_dialogResize 0"
+                    toonSmear_suffixFrame;
+
+            columnLayout -adjustableColumn true -rowSpacing 4;
+
+                for ($i = 0; $i < size($keys); $i++)
+                {
+                    textFieldGrp -label $labels[$i]
+                                 -text (toonSmear_suffix($keys[$i]))
+                                 -columnWidth2 150 150
+                                 ("toonSmear_sfx" + $keys[$i] + "Field");
+                }
+
+            setParent ..;   // columnLayout -> frameLayout
+        setParent ..;       // frameLayout  -> $col
+    setParent ..;           // $col         -> $form
+
+    // --- Buttons and messages (pinned to the bottom) ----------------------
+    string $btnCol = `columnLayout -adjustableColumn true -rowSpacing 6`;
+
         rowLayout -numberOfColumns 2 -columnWidth2 150 150
                   -columnAttach2 "both" "both";
             button -label "OK" -command "toonSmear_dialogOk";
             button -label "Cancel" -command "layoutDialog -dismiss \"Cancel\"";
         setParent ..;
 
-    setParent ..;
+        // Shows validation messages without closing the dialog
+        text -label " " -align "center" toonSmear_errorLabel;
+
+    setParent ..;           // $btnCol -> $form
 
     formLayout -edit
-        -attachForm $col "top"   10
-        -attachForm $col "left"  10
-        -attachForm $col "right" 10
+        -attachForm $col    "top"    10
+        -attachForm $col    "left"   10
+        -attachForm $col    "right"  10
+        -attachForm $btnCol "left"   10
+        -attachForm $btnCol "right"  10
+        -attachForm $btnCol "bottom" 10
         $form;
 }
 
@@ -112,20 +245,56 @@ global proc toonSmear_dialogOk ()
         return;
     }
 
-    if (`objExists ($n + "Smear_grp")`)
+    // Read and validate the suffixes
+    string $keys[] = {"Grp", "Crv", "Srf", "Geo"};
+    string $sfx[];
+    int $i;
+
+    for ($i = 0; $i < size($keys); $i++)
+    {
+        $sfx[$i] = toonSmear_cleanSuffix(
+            `textFieldGrp -query -text ("toonSmear_sfx" + $keys[$i] + "Field")`);
+
+        // Allowed: empty, or letters/digits/underscores. "a" is prepended
+        // only so isValidObjectName doesn't reject a leading digit.
+        if ($sfx[$i] != "" && !isValidObjectName("a" + $sfx[$i]))
+        {
+            frameLayout -edit -collapse false toonSmear_suffixFrame;
+            toonSmear_dialogResize 0;
+            text -edit -label "Suffixes may only contain letters, numbers and _."
+                 toonSmear_errorLabel;
+            return;
+        }
+    }
+
+    // Group, geometry and the expression ("exp") share the "Smear" descriptor,
+    // so their suffixes must all differ or the names would collide.
+    if ($sfx[0] == $sfx[3] || $sfx[0] == "exp" || $sfx[3] == "exp")
+    {
+        frameLayout -edit -collapse false toonSmear_suffixFrame;
+        toonSmear_dialogResize 0;
+        text -edit -label "Group and Geometry suffixes must differ (and not be 'exp')."
+             toonSmear_errorLabel;
+        return;
+    }
+
+    if (`objExists (toonSmear_name($n, "Smear", $sfx[0]))`)
     {
         text -edit -label ("A smear named '" + $n + "' already exists.")
              toonSmear_errorLabel;
         return;
     }
 
-    int $trail  = `intSliderGrp -query -value toonSmear_trailField`;
-    
+    int $trail = `intSliderGrp -query -value toonSmear_trailField`;
+
     // Clamp in case a typed value got past the field limits
     $trail = max(3, min(60, $trail));
 
-    optionVar -stringValue "toonSmear_name"   $n;
-    optionVar -intValue    "toonSmear_trail"  $trail;
+    optionVar -stringValue "toonSmear_name"  $n;
+    optionVar -intValue    "toonSmear_trail" $trail;
+
+    for ($i = 0; $i < size($keys); $i++)
+        optionVar -stringValue ("toonSmear_sfx" + $keys[$i]) $sfx[$i];
 
     layoutDialog -dismiss "OK";
 }
@@ -137,11 +306,8 @@ global proc toonSmear_dialogOk ()
 //    Shows the settings dialog. Returns the smear name, or "" if cancelled.
 //    The settings themselves are read from the optionVars by smearBuild.
 
-proc string getUI (int $selCount)
+proc string getUI ()
 {
-    global int $gToonSmear_selCount;
-    $gToonSmear_selCount = $selCount;
-
     string $result = `layoutDialog -title "Smear Trail" -uiScript "toonSmear_dialogUI"`;
 
     if ($result != "OK")
@@ -166,8 +332,10 @@ proc string buildLiveCurve (string $sel[], string $name)
     if (catch(`loadPlugin -quiet "matrixNodes"`))
         warning "Could not load matrixNodes; decomposeMatrix may be unavailable.";
 
+    string $crvName = toonSmear_name($name, "SmearLive", toonSmear_suffix("Crv"));
+
     // Placeholder points (CVs get driven below)
-    string $cmd = ("curve -d 1 -n \"" + $name + "SmearLive_crv\"");
+    string $cmd = ("curve -d 1 -n \"" + $crvName + "\"");
     for ($i = 0; $i < $n; $i++)
         $cmd += (" -p " + $i + " 0 0");
     string $crv = eval($cmd);
@@ -181,7 +349,7 @@ proc string buildLiveCurve (string $sel[], string $name)
     // connect it to its corresponding CV's world pos
     for ($i = 0; $i < $n; $i++)
     {
-        string $dm = `createNode decomposeMatrix -n ($name + "SmearDM" + ($i + 1))`;
+        string $dm = `createNode decomposeMatrix -n (toonSmear_name($name, ("SmearDM" + ($i + 1)), ""))`;
         connectAttr -force ($sel[$i] + ".worldMatrix[0]") ($dm + ".inputMatrix");
         connectAttr -force ($dm + ".outputTranslate")
                            ($shapes[0] + ".controlPoints[" + $i + "]");
@@ -204,7 +372,7 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
     float $frame = `currentTime -query`;
 
     // Returns: [0] = snapshot group, [1] = snapshot node
-    string $snap[] = `snapshot -n ($name + "Snap")
+    string $snap[] = `snapshot -n (toonSmear_name($name, "Snap", ""))
                                -ch on
                                -startTime ($frame - $trail)
                                -endTime $frame
@@ -213,7 +381,7 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
 
     string $snapNode = $snap[1];
 
-    expression -n ($name + "Smear_exp") -s (
+    expression -n (toonSmear_name($name, "Smear", "exp")) -s (
         $snapNode + ".startTime = frame - " + $trail + ";\n" +
         $snapNode + ".endTime = frame;\n" +
         $snapNode + ".increment = 1;\n"
@@ -223,10 +391,12 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
 
     // Rename right away
     int $i;
+    string $crvSuffix = toonSmear_suffix("Crv");
     for ($i = 0; $i < size($trailCrvs); $i++)
-        $trailCrvs[$i] = `rename $trailCrvs[$i] ($name + "SmearTrail" + ($i + 1) + "_crv")`;
+        $trailCrvs[$i] = `rename $trailCrvs[$i]
+                                 (toonSmear_name($name, ("SmearTrail" + ($i + 1)), $crvSuffix))`;
 
-    $outGrp[0] = `rename $snap[0] ($name + "SmearTrail_grp")`;
+    $outGrp[0] = `rename $snap[0] (toonSmear_name($name, "SmearTrail", toonSmear_suffix("Grp")))`;
 
     return $trailCrvs;
 }
@@ -268,7 +438,7 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
     // Loft degree can't exceed (sections - 1)
     int $deg = min(3, size($trailCrvs) - 1);
 
-    string $loft[] = `loft -n ($name + "SmearLoft")
+    string $loft[] = `loft -n (toonSmear_name($name, "SmearLoft", toonSmear_suffix("Srf")))
                            -ch on
                            -ss 2
                            -d $deg
@@ -277,7 +447,7 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
     // history, quads, general format, u/v number 2/5.
     // Without -ut/-vt set, these counts rely on the command's default
     // tessellation types; if the mesh density looks off, check those flags.
-    string $geo[] = `nurbsToPoly -n ($name + "Smear_geo")
+    string $geo[] = `nurbsToPoly -n (toonSmear_name($name, "Smear", toonSmear_suffix("Geo")))
                                  -ch on
                                  -pt 1
                                  -f 2
@@ -297,7 +467,7 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
 proc string smearBuild (string $sel[], string $name)
 {
     // --- Settings (chosen in the dialog, stored in optionVars) ------------
-    int $trail       = `optionVar -query "toonSmear_trail"`;   // frames of trail
+    int $trail = `optionVar -query "toonSmear_trail"`;   // frames of trail
     // ----------------------------------------------------------------------
 
     string $crv = buildLiveCurve($sel, $name);
@@ -329,7 +499,7 @@ proc string smearBuild (string $sel[], string $name)
     string $made[] = loftSmear($trailCrvs, $name);
 
     // Tidy: everything under one group, intermediates hidden
-    string $grp = `group -empty -n ($name + "Smear_grp")`;
+    string $grp = `group -empty -n (toonSmear_name($name, "Smear", toonSmear_suffix("Grp")))`;
     parent $crv $snapGrp[0] $made[0] $made[1] $grp;
 
     hide $crv;
@@ -360,11 +530,12 @@ proc toonSmear ()
             error ("Selection must be transforms only (not components): " + $each);
     }
 
-    string $name = getUI(size($sel));
+    string $name = getUI();
     if ($name == "")
         return;
 
-    if (`objExists ($name + "Smear_grp")`)
+    // Also checked in the dialog; kept as a safety net
+    if (`objExists (toonSmear_name($name, "Smear", toonSmear_suffix("Grp")))`)
         error ("A smear named '" + $name + "' already exists. Choose another name.");
 
     undoInfo -openChunk;
