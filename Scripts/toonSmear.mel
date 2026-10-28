@@ -1,6 +1,6 @@
 // toonSmear.mel (formerly called "smearTrail")
 //
-// version: 3.2.2
+// version: 3.3.0
 //
 // Generates a cartoon-style "smear trail" mesh that follows animated
 // transforms (joints, locators, rivets, etc.).
@@ -8,12 +8,14 @@
 // USAGE
 //   1. Select two or more animated transforms IN THE ORDER you want them
 //      connected (pick order is respected; they do not need to share a
-//      hierarchy).
+//      hierarchy). OR select two or more mesh components (vertices, edges or
+//      faces) one at a time, in order: a locator is created on each and
+//      pinned to the mesh (see ANCHORS). Don't mix transforms and components.
 //   2. Run the script, then enter a name and adjust the settings:
 //        - Trail length (frames): how far back the trail reaches (min 3, so
 //          the loft can always be degree 3).
 //        - Suffixes (collapsed section): the suffix used on groups, curves,
-//          the loft surface and the final geometry. A leading underscore is
+//          the loft surface, the final geometry and anchor locators. A leading underscore is
 //          optional; one is always added between the descriptor and suffix.
 //      Settings are remembered between runs (optionVars named toonSmear_*).
 //
@@ -28,6 +30,22 @@
 //   - The loft is converted to polygons. Everything is parented under
 //     <name>_smear_<groupSuffix>, which should stay at identity (don't move it).
 //
+// ANCHORS (only when mesh components are selected)
+//   - Each component becomes a visible locator driven by a proximityPin node
+//     (Maya 2020+). The pin follows the closest point on the mesh through
+//     deformation, and needs no UVs. One proximityPin is made per mesh.
+//   - The pin binds against the mesh's original (pre-deformation) shape, so
+//     for meshes with deformers the rest position is read from that shape.
+//     A mesh that is driven by something but has no Orig shape (e.g. an
+//     Alembic cache) gets a hidden, frozen copy made at the current frame to
+//     serve as its rest geometry.
+//   - Rest positions are read in the mesh's object space, so the mesh
+//     transform can be offset or animated.
+//   - After the anchors are built, each is compared with its component's
+//     current position, and a warning is shown if they don't match.
+//   - Pick order matters, so "Track selection order" must be on. If it is
+//     off the script turns it on and asks you to reselect.
+//
 // NAMING
 //   Every node is named <name>_<descriptor>_<suffix>, e.g. with name "arm":
 //     arm_smear_grp          top group
@@ -36,10 +54,15 @@
 //     arm_smearTrail1_crv    trail curves
 //     arm_smearLoft_srf      loft surface
 //     arm_smear_geo          final polygon geometry
-//   Fixed names (no suffix field): arm_snap, arm_smear_exp, arm_smearDM1...
+//     arm_smearAnchors_grp   anchor group (mesh components only)
+//     arm_anchor1_loc        anchor locators (mesh components only)
+//     arm_smearRest1_geo     frozen rest copy (only for meshes with no Orig shape)
+//   Fixed names (no suffix field): arm_snap, arm_smear_exp, arm_smearDM1,
+//   arm_smearPin1...
 //
 // NOTES
 //   - Written against Maya 2022 conventions, tested in Maya 2027.
+//   - Anchors from mesh components need Maya 2020 or later (proximityPin).
 //   - If the targets don't move during the trail window (current frame minus
 //     trail length, up to the current frame) on the frame you run this, all
 //     trail curves coincide and Maya reports tessellation errors. The script
@@ -88,7 +111,7 @@ global proc string toonSmear_name (string $name, string $descriptor, string $suf
 }
 
 // toonSmear_suffix
-//    Current suffix for a key ("Grp", "Crv", "Srf", "Geo"): the saved
+//    Current suffix for a key ("Grp", "Crv", "Srf", "Geo", "Loc"): the saved
 //    optionVar if there is one, otherwise the default.
 
 global proc string toonSmear_suffix (string $key)
@@ -102,6 +125,7 @@ global proc string toonSmear_suffix (string $key)
     if ($key == "Crv") return "crv";
     if ($key == "Srf") return "srf";
     if ($key == "Geo") return "geo";
+    if ($key == "Loc") return "loc";
     return "";
 }
 
@@ -121,6 +145,7 @@ global proc string toonSmear_suffix (string $key)
 //      toonSmear_sfxCrv   (string)  curve suffix
 //      toonSmear_sfxSrf   (string)  loft surface suffix
 //      toonSmear_sfxGeo   (string)  polygon geometry suffix
+//      toonSmear_sfxLoc   (string)  anchor locator suffix
 //
 //    $gToonSmear_form holds the dialog's top-level form so the suffix
 //    section can resize it when expanded/collapsed. Each proc that uses a
@@ -136,7 +161,7 @@ global proc int toonSmear_dialogHeight (int $collapsed)
 {
     if ($collapsed)
         return 190;
-    return 320;
+    return 350;
 }
 
 global proc toonSmear_dialogResize (int $collapsed)
@@ -159,8 +184,8 @@ global proc toonSmear_dialogUI ()
         $trail = `optionVar -query "toonSmear_trail"`;
 
     // Suffix keys and the labels shown for them
-    string $keys[]   = {"Grp", "Crv", "Srf", "Geo"};
-    string $labels[] = {"Group", "Curve", "Surface", "Geometry"};
+    string $keys[]   = {"Grp", "Crv", "Srf", "Geo", "Loc"};
+    string $labels[] = {"Group", "Curve", "Surface", "Geometry", "Locator"};
     int $i;
 
     // layoutDialog dimensions (starts with the suffix section collapsed)
@@ -246,7 +271,7 @@ global proc toonSmear_dialogOk ()
     }
 
     // Read and validate the suffixes
-    string $keys[] = {"Grp", "Crv", "Srf", "Geo"};
+    string $keys[] = {"Grp", "Crv", "Srf", "Geo", "Loc"};
     string $sfx[];
     int $i;
 
@@ -461,6 +486,288 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
 
 ///////////////////////////////////////////////////////////////////////////
 
+// notifyUser
+//    Warning in the Script Editor plus a viewport message. The status bar only
+//    shows the latest message, so later Maya errors would bury a plain warning.
+
+proc notifyUser (string $msg)
+{
+    // Script Editor log
+    warning $msg;
+
+    // Viewport message (catch in case there's no UI, e.g. batch mode)
+    catch(`inViewMessage -assistMessage ("<hl>Smear:</hl> " + $msg)
+                         -position midCenterTop
+                         -fade
+                         -fadeStayTime 6000`);
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// componentType
+//    "vtx", "e" or "f" for those mesh components, "other" for any other kind
+//    of component (cv, uv, ...), or "" if the item isn't a component at all.
+
+proc string componentType (string $item)
+{
+    string $parts[];
+    int $n = `tokenize $item "." $parts`;
+
+    if ($n < 2)
+        return "";
+
+    if (substring($parts[1], 1, 4) == "vtx[") return "vtx";
+    if (substring($parts[1], 1, 2) == "e[")   return "e";
+    if (substring($parts[1], 1, 2) == "f[")   return "f";
+    return "other";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// avgPos
+//    Average position of a list of vertices: world space if $world is 1,
+//    otherwise object space (relative to the mesh's own transform).
+
+proc float[] avgPos (string $verts[], int $world)
+{
+    float $sum[] = {0.0, 0.0, 0.0};
+    int $n = size($verts);
+    int $i;
+
+    for ($i = 0; $i < $n; $i++)
+    {
+        float $p[];
+        if ($world)
+            $p = `xform -query -worldSpace -translation $verts[$i]`;
+        else
+            $p = `xform -query -objectSpace -translation $verts[$i]`;
+
+        $sum[0] += $p[0];
+        $sum[1] += $p[1];
+        $sum[2] += $p[2];
+    }
+
+    if ($n > 0)
+    {
+        $sum[0] /= $n;
+        $sum[1] /= $n;
+        $sum[2] /= $n;
+    }
+    return $sum;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// meshShapeOf
+//    Component names can come back qualified by the transform or by the
+//    shape. Returns the (non-intermediate) mesh shape for either, or "".
+
+proc string meshShapeOf (string $node)
+{
+    if (`nodeType $node` == "mesh")
+        return $node;
+
+    if (`objectType -isAType "transform" $node`)
+    {
+        string $shapes[] = `listRelatives -shapes -noIntermediate -fullPath -type "mesh" $node`;
+        if (size($shapes) > 0)
+            return $shapes[0];
+    }
+    return "";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// findOrigShape
+//    For a deformed mesh, returns the intermediate ("Orig") shape that feeds
+//    the deformers. Returns "" if the mesh has none (not deformed).
+
+proc string findOrigShape (string $shape)
+{
+    string $parent[] = `listRelatives -parent -fullPath $shape`;
+    string $siblings[] = `listRelatives -shapes -fullPath $parent[0]`;
+    string $s;
+
+    for ($s in $siblings)
+    {
+        if ($s == $shape)
+            continue;
+
+        if (`nodeType $s` == "mesh" && `getAttr ($s + ".intermediateObject")`)
+        {
+            // The real Orig shape feeds something; leftover orphans don't
+            string $dst[] = `listConnections -source false -destination true $s`;
+            if (size($dst) > 0)
+                return $s;
+        }
+    }
+    return "";
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// freezeRestCopy
+//    For meshes with no Orig shape that are still driven by something (such
+//    as an Alembic cache): duplicates the mesh at the current frame, hides the
+//    copy and parents it under $grp. The copy is a static snapshot, so it can
+//    act as the pin's rest geometry. Returns the copy's mesh shape.
+
+proc string freezeRestCopy (string $shape, string $name, int $index, string $grp)
+{
+    string $par[] = `listRelatives -parent -fullPath $shape`;
+    string $dup[] = `duplicate -returnRootsOnly $par[0]`;
+
+    string $renamed = `rename $dup[0] (toonSmear_name($name, ("smearRest" + $index), toonSmear_suffix("Geo")))`;
+    string $moved[] = `parent $renamed $grp`;
+    hide $moved[0];
+
+    string $shapes[] = `listRelatives -shapes -noIntermediate -fullPath -type "mesh" $moved[0]`;
+    return $shapes[0];
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// createAnchors
+//    Creates one visible locator per mesh component (in selection order),
+//    each driven by a proximityPin on that component's mesh.
+//    Returns the locators. $outGrp[0] receives the anchor group name.
+
+proc string[] createAnchors (string $items[], string $name, string $outGrp[])
+{
+    // One proximityPin per mesh
+    string $meshes[];
+    string $pins[];
+    string $rests[];     // shape whose outMesh is the rest geometry ("" = the mesh itself)
+    int    $pinCount[];
+
+    string $anchors[];
+    float  $expected[];
+    int $i, $v;
+
+    string $grp = `group -empty -n (toonSmear_name($name, "smearAnchors", toonSmear_suffix("Grp")))`;
+    $outGrp[0] = $grp;
+
+    for ($i = 0; $i < size($items); $i++)
+    {
+        // Component names can be qualified by the transform or the shape
+        string $parts[];
+        tokenize $items[$i] "." $parts;
+        string $shape = meshShapeOf($parts[0]);
+
+        if ($shape == "")
+            error ("Anchors can only be made on polygon meshes: " + $items[$i]);
+
+        // Find or create this mesh's pin
+        int $m = stringArrayFind($shape, 0, $meshes);
+        if ($m < 0)
+        {
+            $m = size($meshes);
+
+            // Rest geometry: the Orig shape, if the mesh has deformers
+            string $rest = findOrigShape($shape);
+
+            // No Orig shape but still driven by something (e.g. an Alembic
+            // cache): freeze a copy now, since the mesh's own outMesh would
+            // keep changing and can't act as a rest pose
+            if ($rest == "")
+            {
+                string $inputs[] = `listConnections -source true -destination false ($shape + ".inMesh")`;
+                if (size($inputs) > 0)
+                    $rest = freezeRestCopy($shape, $name, ($m + 1), $grp);
+            }
+
+            string $pin = `createNode proximityPin -n (toonSmear_name($name, ("smearPin" + ($m + 1)), ""))`;
+
+            connectAttr -force ($shape + ".worldMesh[0]") ($pin + ".deformedGeometry");
+
+            if ($rest != "")
+                connectAttr -force ($rest + ".outMesh") ($pin + ".originalGeometry");
+            else
+                connectAttr -force ($shape + ".outMesh") ($pin + ".originalGeometry");
+
+            $meshes[$m]   = $shape;
+            $pins[$m]     = $pin;
+            $rests[$m]    = $rest;
+            $pinCount[$m] = 0;
+        }
+
+        // The vertices that make up this component (a vertex is just itself)
+        string $verts[] = `polyListComponentConversion -toVertex $items[$i]`;
+        $verts = `ls -flatten -long $verts`;
+
+        // Where the component is right now, in world space (used for the check)
+        float $cur[] = avgPos($verts, 1);
+
+        // Rest position in the mesh's OBJECT space: the pin's original geometry
+        // is local, so this doesn't depend on where the mesh transform is
+        string $restShape = $shape;
+        if ($rests[$m] != "")
+            $restShape = $rests[$m];
+
+        string $restVerts[];
+        clear $restVerts;
+        for ($v = 0; $v < size($verts); $v++)
+        {
+            string $vp[];
+            tokenize $verts[$v] "." $vp;
+            $restVerts[$v] = ($restShape + "." + $vp[1]);
+        }
+        float $rest[] = avgPos($restVerts, 0);
+
+        // Visible anchor locator
+        string $loc[] = `spaceLocator -n (toonSmear_name($name, ("anchor" + ($i + 1)), toonSmear_suffix("Loc")))`;
+        string $parented[] = `parent $loc[0] $grp`;
+        string $long[] = `ls -long $parented[0]`;
+        $anchors[$i] = $long[0];
+
+        // Bind: rest matrix in, pinned matrix out
+        int $k = $pinCount[$m];
+        $pinCount[$m] = $k + 1;
+
+        setAttr ($pins[$m] + ".inputMatrix[" + $k + "]") -type "matrix"
+                1 0 0 0  0 1 0 0  0 0 1 0  $rest[0] $rest[1] $rest[2] 1;
+
+        connectAttr -force ($pins[$m] + ".outputMatrix[" + $k + "]")
+                           ($anchors[$i] + ".offsetParentMatrix");
+
+        // Where this anchor should be right now (checked below)
+        $expected[($i * 3)]     = $cur[0];
+        $expected[($i * 3) + 1] = $cur[1];
+        $expected[($i * 3) + 2] = $cur[2];
+    }
+
+    // Compare each anchor with where its component actually is right now
+    string $bad[];
+    clear $bad;
+    for ($i = 0; $i < size($anchors); $i++)
+    {
+        float $got[] = `xform -query -worldSpace -translation $anchors[$i]`;
+        float $dx = $got[0] - $expected[($i * 3)];
+        float $dy = $got[1] - $expected[($i * 3) + 1];
+        float $dz = $got[2] - $expected[($i * 3) + 2];
+        float $dist = sqrt($dx * $dx + $dy * $dy + $dz * $dz);
+
+        if ($dist > 0.001)
+            $bad[size($bad)] = ($anchors[$i] + " (off by " + $dist + ")");
+    }
+
+    if (size($bad) > 0)
+        notifyUser("Some anchors don't sit on their components: " +
+                   stringArrayToString($bad, ", ") +
+                   ". The pin may be bound to the wrong rest geometry for this mesh.");
+
+    return $anchors;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
 // smearBuild
 //    Does the work. Returns the top-level group name.
 
@@ -486,14 +793,7 @@ proc string smearBuild (string $sel[], string $name)
                        ". The trail curves coincide, so tessellation errors are expected. " +
                        "The smear will update once you move to a frame with motion.");
 
-        // Script Editor log
-        warning $msg;
-
-        // Viewport message (catch in case there's no UI, e.g. batch mode)
-        catch(`inViewMessage -assistMessage ("<hl>Smear:</hl> " + $msg)
-                             -position midCenterTop
-                             -fade
-                             -fadeStayTime 6000`);
+        notifyUser($msg);
     }
 
     string $made[] = loftSmear($trailCrvs, $name);
@@ -511,23 +811,79 @@ proc string smearBuild (string $sel[], string $name)
 
 ///////////////////////////////////////////////////////////////////////////
 
+// smearRun
+//    Creates anchors first when mesh components were selected, then builds
+//    the smear. Returns the top-level group name.
+
+proc string smearRun (string $items[], string $name, int $useComponents)
+{
+    string $targets[] = $items;
+    string $anchorGrp[];
+
+    if ($useComponents)
+        $targets = createAnchors($items, $name, $anchorGrp);
+
+    string $grp = smearBuild($targets, $name);
+
+    if ($useComponents)
+        parent $anchorGrp[0] $grp;
+
+    return $grp;
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
 // toonSmear
 //    Entry point: validate selection, show settings, build inside one undo chunk.
 
 proc toonSmear ()
 {
-    // Pick order is respected; long names avoid duplicate-name ambiguity
-    string $sel[] = `ls -sl -long`;
+    // Flattened, so compressed ranges like vtx[3:5] become single components
+    string $items[] = `ls -selection -flatten -long`;
 
-    if (size($sel) < 2)
-        error "Must select at least 2 transforms to generate smear";
+    if (size($items) < 2)
+        error "Must select at least 2 transforms or mesh components to generate smear";
 
-    // This may change when geo selection is added later
+    // Transforms OR mesh components, not both (for now)
+    int $numComps  = 0;
+    int $numXforms = 0;
     string $each;
-    for ($each in $sel)
+    for ($each in $items)
     {
-        if (!`objectType -isAType "transform" $each`)
-            error ("Selection must be transforms only (not components): " + $each);
+        string $type = componentType($each);
+
+        if ($type == "other")
+            error ("Unsupported component (use vertices, edges or faces): " + $each);
+
+        if ($type != "")
+            $numComps++;
+        else if (`objectType -isAType "transform" $each`)
+            $numXforms++;
+        else
+            error ("Selection must be transforms or mesh components: " + $each);
+    }
+
+    if ($numComps > 0 && $numXforms > 0)
+        error "Select either transforms or mesh components, not both.";
+
+    int $useComponents = ($numComps > 0);
+
+    // Components need a reliable pick order
+    if ($useComponents)
+    {
+        if (!`selectPref -query -trackSelectionOrder`)
+        {
+            selectPref -trackSelectionOrder true;
+            error ("Selection order tracking was off, so it has been turned on. " +
+                   "Reselect the components in the order you want and run again.");
+        }
+
+        string $ordered[] = `ls -orderedSelection -flatten -long`;
+        if (size($ordered) != size($items))
+            error "Couldn't read the selection order. Reselect the components one at a time and run again.";
+
+        $items = $ordered;
     }
 
     string $name = getUI();
@@ -539,16 +895,20 @@ proc toonSmear ()
         error ("A smear named '" + $name + "' already exists. Choose another name.");
 
     undoInfo -openChunk;
-    int $failed = catch(`smearBuild $sel $name`);
+    int $failed = catch(`smearRun $items $name $useComponents`);
     undoInfo -closeChunk;
 
     // Restore the user's selection
-    select -r $sel;
+    select -r $items;
 
     if ($failed)
         error "Smear creation failed; see Script Editor for details.";
 
-    print ("Smear '" + $name + "' created from " + size($sel) + " transforms.\n");
+    string $what = "transforms";
+    if ($useComponents)
+        $what = "mesh components";
+
+    print ("Smear '" + $name + "' created from " + size($items) + " " + $what + ".\n");
 }
 
 ///////////////////////////////////////////////////////////////////////////
