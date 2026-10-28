@@ -1,16 +1,15 @@
-// toonSmear.mel (formerly called "smearTrail")
+// toonSmear.mel
 //
-// version: 3.3.0
+// version: 3.3.1
 //
-// Generates a cartoon-style "smear trail" mesh that follows animated
-// transforms (joints, locators, rivets, etc.).
+// Generates a cartoon-style "smear trail" mesh from a selection of transforms or components
 //
 // USAGE
-//   1. Select two or more animated transforms IN THE ORDER you want them
-//      connected (pick order is respected; they do not need to share a
-//      hierarchy). OR select two or more mesh components (vertices, edges or
-//      faces) one at a time, in order: a locator is created on each and
-//      pinned to the mesh (see ANCHORS). Don't mix transforms and components.
+//   1. Select 2+ animated transforms IN THE ORDER you want them
+//      connected (they do not need to share a hierarchy).
+//      OR
+//		select 2+ mesh components (any type, can be mixed) in order. A locator is created
+//      on each and pinned to the mesh (see ANCHORS). Don't mix transforms and components.
 //   2. Run the script, then enter a name and adjust the settings:
 //        - Trail length (frames): how far back the trail reaches (min 3, so
 //          the loft can always be degree 3).
@@ -31,8 +30,8 @@
 //     <name>_smear_<groupSuffix>, which should stay at identity (don't move it).
 //
 // ANCHORS (only when mesh components are selected)
-//   - Each component becomes a visible locator driven by a proximityPin node
-//     (Maya 2020+). The pin follows the closest point on the mesh through
+//   - Each component becomes a visible locator driven by a proximityPin node.
+//     The pin follows the closest point on the mesh through
 //     deformation, and needs no UVs. One proximityPin is made per mesh.
 //   - The pin binds against the mesh's original (pre-deformation) shape, so
 //     for meshes with deformers the rest position is read from that shape.
@@ -61,13 +60,12 @@
 //   arm_smearPin1...
 //
 // NOTES
-//   - Written against Maya 2022 conventions, tested in Maya 2027.
+//   - Tested in Maya 2027.
 //   - Anchors from mesh components need Maya 2020 or later (proximityPin).
 //   - If the targets don't move during the trail window (current frame minus
-//     trail length, up to the current frame) on the frame you run this, all
-//     trail curves coincide and Maya reports tessellation errors. The script
-//     warns about this, and the smear updates once you scrub to a frame with
-//     motion.
+//     trail length, up to current frame) all trail curves coincide and Maya
+//     reports tessellation errors. The script warns about this, and
+//     the smear updates once you scrub to a frame with motion.
 //   - Snapshots evaluate the target at past times, so this works for
 //     keyframed animation but not for sims that depend on prior state.
 
@@ -186,7 +184,6 @@ global proc toonSmear_dialogUI ()
     // Suffix keys and the labels shown for them
     string $keys[]   = {"Grp", "Crv", "Srf", "Geo", "Loc"};
     string $labels[] = {"Group", "Curve", "Surface", "Geometry", "Locator"};
-    int $i;
 
     // layoutDialog dimensions (starts with the suffix section collapsed)
     string $form = `setParent -query`;
@@ -273,7 +270,6 @@ global proc toonSmear_dialogOk ()
     // Read and validate the suffixes
     string $keys[] = {"Grp", "Crv", "Srf", "Geo", "Loc"};
     string $sfx[];
-    int $i;
 
     for ($i = 0; $i < size($keys); $i++)
     {
@@ -351,7 +347,6 @@ proc string getUI ()
 proc string buildLiveCurve (string $sel[], string $name)
 {
     int $n = size($sel);
-    int $i;
 
     // matrixNodes ships with Maya; this guard is harmless if already loaded
     if (catch(`loadPlugin -quiet "matrixNodes"`))
@@ -415,7 +410,6 @@ proc string[] snapshotLive (string $crv, string $name, int $trail, string $outGr
     string $trailCrvs[] = `listRelatives -children -path $snap[0]`;
 
     // Rename right away
-    int $i;
     string $crvSuffix = toonSmear_suffix("Crv");
     for ($i = 0; $i < size($trailCrvs); $i++)
         $trailCrvs[$i] = `rename $trailCrvs[$i]
@@ -438,7 +432,6 @@ proc int trailHasMotion (string $trailCrvs[], float $tol)
 {
     float $ref[] = `xform -query -worldSpace -translation ($trailCrvs[0] + ".cv[*]")`;
 
-    int $c, $k;
     for ($c = 1; $c < size($trailCrvs); $c++)
     {
         float $pos[] = `xform -query -worldSpace -translation ($trailCrvs[$c] + ".cv[*]")`;
@@ -534,7 +527,6 @@ proc float[] avgPos (string $verts[], int $world)
 {
     float $sum[] = {0.0, 0.0, 0.0};
     int $n = size($verts);
-    int $i;
 
     for ($i = 0; $i < $n; $i++)
     {
@@ -590,7 +582,6 @@ proc string findOrigShape (string $shape)
 {
     string $parent[] = `listRelatives -parent -fullPath $shape`;
     string $siblings[] = `listRelatives -shapes -fullPath $parent[0]`;
-    string $s;
 
     for ($s in $siblings)
     {
@@ -648,7 +639,6 @@ proc string[] createAnchors (string $items[], string $name, string $outGrp[])
 
     string $anchors[];
     float  $expected[];
-    int $i, $v;
 
     string $grp = `group -empty -n (toonSmear_name($name, "smearAnchors", toonSmear_suffix("Grp")))`;
     $outGrp[0] = $grp;
@@ -848,7 +838,6 @@ proc toonSmear ()
     // Transforms OR mesh components, not both (for now)
     int $numComps  = 0;
     int $numXforms = 0;
-    string $each;
     for ($each in $items)
     {
         string $type = componentType($each);
