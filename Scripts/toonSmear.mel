@@ -1,6 +1,6 @@
 // toonSmear.mel
 //
-// version: 3.3.1
+// version: 3.3.2
 //
 // Generates a cartoon-style "smear trail" mesh from a selection of transforms or components
 //
@@ -38,6 +38,10 @@
 //     A mesh that is driven by something but has no Orig shape (e.g. an
 //     Alembic cache) gets a hidden, frozen copy made at the current frame to
 //     serve as its rest geometry.
+//   - The mesh must not have history that changes its topology after the
+//     deformers (e.g. added edge loops), because the pin needs the mesh to
+//     match its original shape. The script checks this before doing anything
+//     else and stops with a message if it doesn't.
 //   - Rest positions are read in the mesh's object space, so the mesh
 //     transform can be offset or animated.
 //   - After the anchors are built, each is compared with its component's
@@ -602,6 +606,64 @@ proc string findOrigShape (string $shape)
 
 ///////////////////////////////////////////////////////////////////////////
 
+// checkRestTopology
+//    A proximityPin needs the deformed mesh and its original shape to have
+//    identical topology. History that changes the topology (added edge loops,
+//    smooths, merges...) sits between the two when it comes after the
+//    deformers, so the counts differ and the pin outputs garbage (usually
+//    everything at the origin). Stops with an explanation if they differ.
+
+proc checkRestTopology (string $shape, string $orig)
+{
+    int $vCur[]  = `polyEvaluate -vertex $shape`;
+    int $vRest[] = `polyEvaluate -vertex $orig`;
+    int $fCur[]  = `polyEvaluate -face $shape`;
+    int $fRest[] = `polyEvaluate -face $orig`;
+
+    if ($vCur[0] != $vRest[0] || $fCur[0] != $fRest[0])
+        error ("The mesh " + $shape + " has " + $vCur[0] + " vertices and " + $fCur[0] +
+               " faces, but its original shape has " + $vRest[0] + " and " + $fRest[0] +
+               ". History that changes the topology (e.g. added edge loops) is after " +
+               "the deformers, so the anchors can't bind. Delete non-deformer history " +
+               "(Edit > Delete by Type > Non-Deformer History) and try again.");
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
+// validateAnchorMeshes
+//    Checks every mesh the components belong to before anything is created
+//    (and before the dialog opens), so a problem is reported as the last
+//    message instead of being swallowed by the build's error handling.
+
+proc validateAnchorMeshes (string $items[])
+{
+    string $checked[];
+
+    for ($i = 0; $i < size($items); $i++)
+    {
+        string $parts[];
+        tokenize $items[$i] "." $parts;
+        string $shape = meshShapeOf($parts[0]);
+
+        if ($shape == "")
+            error ("Anchors can only be made on polygon meshes: " + $items[$i]);
+
+        // Each mesh only needs checking once
+        if (stringArrayFind($shape, 0, $checked) < 0)
+        {
+            $checked[size($checked)] = $shape;
+
+            string $orig = findOrigShape($shape);
+            if ($orig != "")
+                checkRestTopology($shape, $orig);
+        }
+    }
+}
+
+
+///////////////////////////////////////////////////////////////////////////
+
 // freezeRestCopy
 //    For meshes with no Orig shape that are still driven by something (such
 //    as an Alembic cache): duplicates the mesh at the current frame, hides the
@@ -873,6 +935,9 @@ proc toonSmear ()
             error "Couldn't read the selection order. Reselect the components one at a time and run again.";
 
         $items = $ordered;
+
+        // Stop before the dialog if a mesh can't take a pin (see checkRestTopology)
+        validateAnchorMeshes($items);
     }
 
     string $name = getUI();
