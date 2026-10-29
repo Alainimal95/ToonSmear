@@ -1,4 +1,4 @@
 #To Do:
 
-- Add geo select func
+- Add mixed selection to geo select func
 - Add shelf icon
