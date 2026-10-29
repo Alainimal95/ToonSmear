@@ -41,6 +41,7 @@ Alternatively, the script can be run by pressing numpad enter. Select all text i
   <details>
   <summary><b>Deforming meshes</b></summary>
   
+  - Ensure there is no non deformer history on the mesh selection. Failure to delete it will likely result in the anchors not binding
   - Determine a selection of components (can be verts, edges, faces, or any combination of them). Minimum 2 required
   - Run the script
   - Name the smear geo when prompted in the dialog (necessary if making multiple smears)
@@ -50,6 +51,7 @@ Alternatively, the script can be run by pressing numpad enter. Select all text i
   <details>
   <summary><b>Mixing component and transform targets</b></summary>
   
+  - Ensure there is no non deformer history on the mesh selection. Failure to delete it will likely result in the anchors not binding
   - Don't mix component and transform selections for the workflows above
   - Instead, for each desired component, select it then place a rivet constraint or proximity pin. You should then see a locator appear at that location
   - Select the locator(s) and any other transforms in the order you want them connected (same as you would for skeletons or transforming meshes) 
