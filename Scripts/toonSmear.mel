@@ -1,6 +1,6 @@
 // toonSmear.mel
 //
-// version: 3.3.2
+// version: 3.3.3
 //
 // Generates a cartoon-style "smear trail" mesh from a selection of transforms or components
 //
@@ -72,6 +72,9 @@
 //     the smear updates once you scrub to a frame with motion.
 //   - Snapshots evaluate the target at past times, so this works for
 //     keyframed animation but not for sims that depend on prior state.
+//   - Warnings from a run (no motion, anchors not on their components) are
+//     printed in full to the Script Editor. Short one-line versions are shown
+//     in the viewport at the end, each at its own spot.
 
 
 ///////////////////////////////////////////////////////////////////////////
@@ -483,20 +486,29 @@ proc string[] loftSmear (string $trailCrvs[], string $name)
 
 ///////////////////////////////////////////////////////////////////////////
 
-// notifyUser
-//    Warning in the Script Editor plus a viewport message. The status bar only
-//    shows the latest message, so later Maya errors would bury a plain warning.
+// showViewMessages
+//    Shows each collected message as its own viewport message, one per spot,
+//    so they can't cover each other (the status bar also only keeps the latest
+//    message, so these are collected during the build and shown at the end).
+//
+//    inViewMessage doesn't wrap text, and multi-line HTML (<br>) gives a
+//    bubble that is too wide and too short, so every message must be ONE
+//    short line of plain text. The full detail is printed to the Script Editor
+//    where each problem is found. Only as many messages as there are spots
+//    are shown.
 
-proc notifyUser (string $msg)
+proc showViewMessages (string $msgs[])
 {
-    // Script Editor log
-    warning $msg;
+    string $spots[] = {"midCenterTop", "midCenter", "midCenterBot"};
 
-    // Viewport message (catch in case there's no UI, e.g. batch mode)
-    catch(`inViewMessage -assistMessage ("<hl>Smear:</hl> " + $msg)
-                         -position midCenterTop
-                         -fade
-                         -fadeStayTime 6000`);
+    for ($i = 0; $i < size($msgs) && $i < size($spots); $i++)
+    {
+        // catch in case there's no UI, e.g. batch mode
+        catch(`inViewMessage -assistMessage $msgs[$i]
+                             -position $spots[$i]
+                             -fade
+                             -fadeStayTime 6000`);
+    }
 }
 
 
@@ -689,9 +701,10 @@ proc string freezeRestCopy (string $shape, string $name, int $index, string $grp
 // createAnchors
 //    Creates one visible locator per mesh component (in selection order),
 //    each driven by a proximityPin on that component's mesh.
-//    Returns the locators. $outGrp[0] receives the anchor group name.
+//    Returns the locators. $outGrp[0] receives the anchor group name, and short
+//    viewport messages for any problems are appended to $viewMsgs.
 
-proc string[] createAnchors (string $items[], string $name, string $outGrp[])
+proc string[] createAnchors (string $items[], string $name, string $outGrp[], string $viewMsgs[])
 {
     // One proximityPin per mesh
     string $meshes[];
@@ -797,6 +810,7 @@ proc string[] createAnchors (string $items[], string $name, string $outGrp[])
     // Compare each anchor with where its component actually is right now
     string $bad[];
     clear $bad;
+    float $worst = 0.0;
     for ($i = 0; $i < size($anchors); $i++)
     {
         float $got[] = `xform -query -worldSpace -translation $anchors[$i]`;
@@ -806,13 +820,26 @@ proc string[] createAnchors (string $items[], string $name, string $outGrp[])
         float $dist = sqrt($dx * $dx + $dy * $dy + $dz * $dz);
 
         if ($dist > 0.001)
+        {
             $bad[size($bad)] = ($anchors[$i] + " (off by " + $dist + ")");
+
+            if ($dist > $worst)
+                $worst = $dist;
+        }
     }
 
     if (size($bad) > 0)
-        notifyUser("Some anchors don't sit on their components: " +
-                   stringArrayToString($bad, ", ") +
-                   ". The pin may be bound to the wrong rest geometry for this mesh.");
+    {
+        // Full detail for the Script Editor...
+        warning ("Some anchors don't sit on their components: " +
+                 stringArrayToString($bad, ", ") +
+                 ". The pin may be bound to the wrong rest geometry for this mesh.");
+
+        // ...and a short version for the viewport
+        $viewMsgs[size($viewMsgs)] =
+            ("Smear: " + size($bad) + " anchor(s) off their components (worst " +
+             $worst + "). See Script Editor.");
+    }
 
     return $anchors;
 }
@@ -821,9 +848,10 @@ proc string[] createAnchors (string $items[], string $name, string $outGrp[])
 ///////////////////////////////////////////////////////////////////////////
 
 // smearBuild
-//    Does the work. Returns the top-level group name.
+//    Does the work. Returns the top-level group name. Short viewport messages
+//    for any problems are appended to $viewMsgs (shown together by smearRun).
 
-proc string smearBuild (string $sel[], string $name)
+proc string smearBuild (string $sel[], string $name, string $viewMsgs[])
 {
     // --- Settings (chosen in the dialog, stored in optionVars) ------------
     int $trail = `optionVar -query "toonSmear_trail"`;   // frames of trail
@@ -836,16 +864,19 @@ proc string smearBuild (string $sel[], string $name)
 
     // Warn if the targets don't move during the trail window. Maya's own
     // errors in that case (degenerate loft/tessellation) don't say why.
-    // The status bar only shows the latest message, so the tessellation
-    // errors would bury a plain warning. Also show it in the viewport.
     if (!trailHasMotion($trailCrvs, 0.0001))
     {
         float $f = `currentTime -query`;
-        string $msg = ("No motion detected between frames " + ($f - $trail) + " and " + $f +
-                       ". The trail curves coincide, so tessellation errors are expected. " +
-                       "The smear will update once you move to a frame with motion.");
 
-        notifyUser($msg);
+        // Full detail for the Script Editor...
+        warning ("No motion detected between frames " + ($f - $trail) + " and " + $f +
+                 ". The trail curves coincide, so tessellation errors are expected. " +
+                 "The smear will update once you move to a frame with motion.");
+
+        // ...and a short version for the viewport
+        $viewMsgs[size($viewMsgs)] =
+            ("Smear: no motion between frames " + ($f - $trail) + " and " + $f +
+             ", tessellation errors expected.");
     }
 
     string $made[] = loftSmear($trailCrvs, $name);
@@ -871,14 +902,18 @@ proc string smearRun (string $items[], string $name, int $useComponents)
 {
     string $targets[] = $items;
     string $anchorGrp[];
+    string $viewMsgs[];
 
     if ($useComponents)
-        $targets = createAnchors($items, $name, $anchorGrp);
+        $targets = createAnchors($items, $name, $anchorGrp, $viewMsgs);
 
-    string $grp = smearBuild($targets, $name);
+    string $grp = smearBuild($targets, $name, $viewMsgs);
 
     if ($useComponents)
         parent $anchorGrp[0] $grp;
+
+    // Everything that went wrong, as one-line viewport messages
+    showViewMessages($viewMsgs);
 
     return $grp;
 }
